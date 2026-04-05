@@ -6212,8 +6212,33 @@ class TerminalController {
         enterStreamRelay(socket: socket, surface: surface)
     }
 
+    /// Read the current visible terminal screen as plain text.
+    /// Used to send an initial snapshot before live PTY streaming begins.
+    private nonisolated func readScreenSnapshot(surface: ghostty_surface_t) -> String? {
+        let topLeft = ghostty_point_s(
+            tag: GHOSTTY_POINT_VIEWPORT,
+            coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+            x: 0, y: 0
+        )
+        let bottomRight = ghostty_point_s(
+            tag: GHOSTTY_POINT_VIEWPORT,
+            coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+            x: 0, y: 0
+        )
+        let selection = ghostty_selection_s(
+            top_left: topLeft,
+            bottom_right: bottomRight,
+            rectangle: false
+        )
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_text(surface, selection, &text) else { return nil }
+        defer { ghostty_surface_free_text(surface, &text) }
+        guard let ptr = text.text, text.text_len > 0 else { return nil }
+        return String(decoding: Data(bytes: ptr, count: Int(text.text_len)), as: UTF8.self)
+    }
+
     /// Bidirectional relay between a Unix socket and a Ghostty PTY tap.
-    /// Reads PTY output via `ghostty_surface_pty_tap_read` and forwards it as
+    /// Sends an initial screen snapshot, then streams live PTY output as
     /// base64-encoded JSON frames. Reads JSON input from the socket and writes
     /// it into the PTY via `ghostty_surface_pty_write`.
     /// Blocks the calling thread until the client disconnects or an error occurs.
@@ -6223,6 +6248,16 @@ class TerminalController {
             let err = "{\"type\":\"error\",\"message\":\"Failed to open PTY tap\"}\n"
             err.withCString { ptr in _ = write(socket, ptr, strlen(ptr)) }
             return
+        }
+
+        // Send initial screen snapshot so the phone sees existing content
+        if let snapshot = readScreenSnapshot(surface: surface) {
+            let snapshotData = Data(snapshot.utf8)
+            let b64 = snapshotData.base64EncodedString()
+            let frame = "{\"type\":\"snapshot\",\"data\":\"\(b64)\"}\n"
+            frame.withCString { ptr in
+                _ = write(socket, ptr, strlen(ptr))
+            }
         }
 
         // Set socket non-blocking so we can interleave reads from both directions
