@@ -6163,7 +6163,9 @@ class TerminalController {
 
         var surfacePtr: ghostty_surface_t? = nil
         var errorResponse: String? = nil
+        var initialSnapshot: String? = nil
 
+        // Resolve surface AND read snapshot on main thread (ghostty API requirement)
         v2MainSync {
             guard let ws = v2ResolveWorkspace(params: params, tabManager: tabManager) else {
                 errorResponse = v2Error(id: id, code: "not_found", message: "Workspace not found")
@@ -6191,6 +6193,10 @@ class TerminalController {
                 return
             }
             surfacePtr = terminalPanel.surface.surface
+            // Read initial screen snapshot while on main thread
+            if let surface = surfacePtr {
+                initialSnapshot = readScreenSnapshot(surface: surface)
+            }
         }
 
         if let errorResponse {
@@ -6209,12 +6215,12 @@ class TerminalController {
         writeSocketResponse(startMsg, to: socket)
 
         // Enter the blocking relay loop (runs on the current background thread)
-        enterStreamRelay(socket: socket, surface: surface)
+        enterStreamRelay(socket: socket, surface: surface, initialSnapshot: initialSnapshot)
     }
 
     /// Read the current visible terminal screen as plain text.
-    /// Used to send an initial snapshot before live PTY streaming begins.
-    private nonisolated func readScreenSnapshot(surface: ghostty_surface_t) -> String? {
+    /// Must be called on the main thread (ghostty_surface_read_text requires it).
+    private func readScreenSnapshot(surface: ghostty_surface_t) -> String? {
         let topLeft = ghostty_point_s(
             tag: GHOSTTY_POINT_VIEWPORT,
             coord: GHOSTTY_POINT_COORD_TOP_LEFT,
@@ -6237,35 +6243,48 @@ class TerminalController {
         return String(decoding: Data(bytes: ptr, count: Int(text.text_len)), as: UTF8.self)
     }
 
+    /// Writes all bytes to the socket, retrying on partial writes and EINTR.
+    private nonisolated func writeAll(_ socket: Int32, _ data: String) {
+        data.withCString { ptr in
+            var total = 0
+            let len = strlen(ptr)
+            while total < len {
+                let n = Darwin.write(socket, ptr.advanced(by: total), len - total)
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    break // Real error
+                }
+                total += n
+            }
+        }
+    }
+
     /// Bidirectional relay between a Unix socket and a Ghostty PTY tap.
     /// Sends an initial screen snapshot, then streams live PTY output as
     /// base64-encoded JSON frames. Reads JSON input from the socket and writes
     /// it into the PTY via `ghostty_surface_pty_write`.
     /// Blocks the calling thread until the client disconnects or an error occurs.
-    private nonisolated func enterStreamRelay(socket: Int32, surface: ghostty_surface_t) {
+    private nonisolated func enterStreamRelay(socket: Int32, surface: ghostty_surface_t, initialSnapshot: String?) {
         // Open PTY tap with a 64 KB ring buffer
         guard ghostty_surface_pty_tap_open(surface, 65536) else {
-            let err = "{\"type\":\"error\",\"message\":\"Failed to open PTY tap\"}\n"
-            err.withCString { ptr in _ = write(socket, ptr, strlen(ptr)) }
+            writeAll(socket, "{\"type\":\"error\",\"message\":\"Failed to open PTY tap\"}\n")
             return
         }
 
-        // Send initial screen snapshot so the phone sees existing content
-        if let snapshot = readScreenSnapshot(surface: surface) {
+        // Send initial screen snapshot so the client sees existing content
+        if let snapshot = initialSnapshot {
             let snapshotData = Data(snapshot.utf8)
             let b64 = snapshotData.base64EncodedString()
-            let frame = "{\"type\":\"snapshot\",\"data\":\"\(b64)\"}\n"
-            frame.withCString { ptr in
-                _ = write(socket, ptr, strlen(ptr))
-            }
+            writeAll(socket, "{\"type\":\"snapshot\",\"data\":\"\(b64)\"}\n")
         }
 
         // Set socket non-blocking so we can interleave reads from both directions
         let origFlags = fcntl(socket, F_GETFL, 0)
-        fcntl(socket, F_SETFL, origFlags | O_NONBLOCK)
+        _ = fcntl(socket, F_SETFL, origFlags | O_NONBLOCK)
 
         var readBuf = [UInt8](repeating: 0, count: 65536)
         var inputBuffer = ""
+        let maxInputBufferSize = 65536
 
         // Bidirectional relay loop
         while true {
@@ -6282,20 +6301,27 @@ class TerminalController {
             if n > 0 {
                 let data = Data(bytes: readBuf, count: Int(n))
                 let b64 = data.base64EncodedString()
-                let frame = "{\"type\":\"output\",\"data\":\"\(b64)\"}\n"
-                frame.withCString { ptr in
-                    _ = write(socket, ptr, strlen(ptr))
-                }
+                writeAll(socket, "{\"type\":\"output\",\"data\":\"\(b64)\"}\n")
             }
 
             // --- socket → PTY ---
             if pfd.revents & Int16(POLLIN) != 0 {
                 var inBuf = [UInt8](repeating: 0, count: 4096)
-                let bytesRead = read(socket, &inBuf, inBuf.count)
-                if bytesRead <= 0 { break }
+                let bytesRead = Darwin.read(socket, &inBuf, inBuf.count)
+                if bytesRead < 0 {
+                    // Handle transient errors: EAGAIN/EWOULDBLOCK/EINTR are normal
+                    // for non-blocking sockets — just continue the loop.
+                    if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { continue }
+                    break // Real error
+                }
+                if bytesRead == 0 { break } // EOF — client disconnected
 
                 if let str = String(bytes: inBuf[0..<bytesRead], encoding: .utf8) {
                     inputBuffer += str
+                    // Cap input buffer to prevent OOM from malicious clients
+                    if inputBuffer.count > maxInputBufferSize {
+                        inputBuffer = String(inputBuffer.suffix(maxInputBufferSize))
+                    }
                     while let newlineIdx = inputBuffer.firstIndex(of: "\n") {
                         let line = String(inputBuffer[..<newlineIdx])
                         inputBuffer = String(inputBuffer[inputBuffer.index(after: newlineIdx)...])
@@ -6307,7 +6333,7 @@ class TerminalController {
 
         // Cleanup
         ghostty_surface_pty_tap_close(surface)
-        fcntl(socket, F_SETFL, origFlags)
+        _ = fcntl(socket, F_SETFL, origFlags)
     }
 
     /// Handles a single newline-delimited JSON message from the stream client.
@@ -6325,7 +6351,7 @@ class TerminalController {
                 _ = ghostty_surface_pty_write(surface, ptr, UInt32(rawBuf.count))
             }
         case "resize":
-            // Future: handle terminal resize
+            // TODO(surface.stream): Implement terminal resize via ghostty_surface_set_size
             break
         default:
             break
