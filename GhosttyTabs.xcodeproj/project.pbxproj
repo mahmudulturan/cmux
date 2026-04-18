@@ -1077,6 +1077,8 @@
 					UniformTypeIdentifiers,
 					"-framework",
 					Carbon,
+					"-weak_framework",
+					SwiftUICore,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.cmuxterm.app.debug;
 				PRODUCT_NAME = "cmux DEV";
@@ -1116,6 +1118,8 @@
 					UniformTypeIdentifiers,
 					"-framework",
 					Carbon,
+					"-weak_framework",
+					SwiftUICore,
 				);
 				ONLY_ACTIVE_ARCH = NO;
 				PRODUCT_BUNDLE_IDENTIFIER = com.cmuxterm.app;

@@ -3,7 +3,7 @@ name: Build cmux DEV
 on:
   workflow_dispatch:
   push:
-    branches: [feat/surface-stream]
+    branches: [main]
 
 jobs:
   build:
